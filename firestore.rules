@@ -1,0 +1,95 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() { return request.auth != null; }
+    function isSelf(uid) { return isSignedIn() && request.auth.uid == uid; }
+    function isAdmin() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/employees/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/employees/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Mirror of the authorized employee roster. Keyed by lowercased,
+    // whitespace-stripped email address. Admins maintain this from the
+    // in-app Admin > Employees page (Import from Excel), which writes
+    // here directly via the client SDK — see src/lib/allowlistImport.js.
+    // The old scripts/seedAllowedEmployees.mjs (Admin SDK) still works
+    // too, if you'd rather script/CI this instead.
+    function isOnAllowedList(email) {
+      return exists(/databases/$(database)/documents/employee-list/$(email.lower().trim()));
+    }
+
+    match /employee-list/{emailId} {
+      // Public read: RegisterPage's live "are you on the list?" check
+      // runs BEFORE the person has a Firebase Auth session (they're
+      // filling out the registration form, not signed in yet), so this
+      // can't require isSignedIn() or that check would always fail with
+      // permission-denied instead of a real yes/no answer. This
+      // collection only holds non-sensitive roster metadata (name, code,
+      // location) — exactly what's needed to gate self-registration —
+      // never anything a public read would meaningfully expose.
+      allow read: if true;
+      // Only admins can write — either via this client SDK (the Admin
+      // Employees page's Excel import) or the Admin SDK seed script.
+      allow write: if isAdmin();
+    }
+
+    match /employees/{uid} {
+      // Face descriptors are biometric data: an employee may read only their
+      // own doc; admins (Employees / Live Monitor pages) may read all. The old
+      // "any signed-in user" rule existed for pre-login face matching, which
+      // can't work client-side and has been removed.
+      allow read: if isSelf(uid) || isAdmin();
+      // You can only create your OWN profile document during
+      // registration, and only if your email is on the authorized
+      // employee list. This is the real enforcement boundary — the
+      // RegisterPage.jsx check is just a friendlier client-side echo of
+      // this same rule, since a client-side check alone can be bypassed
+      // by calling the Firebase Auth/Firestore SDKs directly.
+      //   - role must be "employee" (otherwise anyone on the list could create
+      //     themselves as an admin)
+      //   - the profile email must be the email this account signed up with, so
+      //     one person can't claim another employee's allowlisted address
+      allow create: if isSelf(uid) &&
+        request.resource.data.role == 'employee' &&
+        request.resource.data.email.lower().trim() == request.auth.token.email.lower() &&
+        isOnAllowedList(request.resource.data.email);
+      // Only an admin may edit someone else's record (e.g. to promote
+      // them to "admin").
+      // Employees may edit their own profile (name, phone, face, ...) but NOT
+      // their own role/uid/email - without this check anyone could promote
+      // themselves to admin with a single client-side updateDoc call.
+      allow update: if isAdmin() ||
+        (isSelf(uid) &&
+          request.resource.data.get('role', 'employee') == resource.data.get('role', 'employee') &&
+          request.resource.data.get('uid', uid) == resource.data.get('uid', uid) &&
+          request.resource.data.get('email', '') == resource.data.get('email', ''));
+      allow delete: if isAdmin();
+    }
+
+    match /attendance/{docId} {
+      // Employees can read their own attendance; admins can read everyone's
+      // (used by the Live Monitor / reports pages).
+      allow read: if isSignedIn() && (resource.data.uid == request.auth.uid || isAdmin());
+      // Check-in creates the day's doc; it must be tagged with YOUR uid.
+      // The doc ID must be "<uid>_<date>" so each person gets exactly one
+      // record per day and can't write records under another ID.
+      allow create: if isSignedIn() &&
+        request.resource.data.uid == request.auth.uid &&
+        docId == request.auth.uid + '_' + request.resource.data.date;
+      // Check-out updates your own doc; admins may also correct records.
+      // The first check-in is immutable for employees (time, lateness, zone,
+      // date, owner); only check-out fields may change, and a later check-out
+      // overwrites an earlier one. Admins may correct anything.
+      allow update: if isSignedIn() &&
+        ((resource.data.uid == request.auth.uid &&
+          request.resource.data.uid == resource.data.uid &&
+          request.resource.data.get('date', null) == resource.data.get('date', null) &&
+          request.resource.data.get('checkInTime', null) == resource.data.get('checkInTime', null) &&
+          request.resource.data.get('startedAt', null) == resource.data.get('startedAt', null) &&
+          request.resource.data.get('isLate', null) == resource.data.get('isLate', null) &&
+          request.resource.data.get('insideOnCheckIn', null) == resource.data.get('insideOnCheckIn', null)) || isAdmin());
+      allow delete: if isAdmin();
+    }
+  }
+}
